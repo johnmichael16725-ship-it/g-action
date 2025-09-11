@@ -1,0 +1,12 @@
+{
+  "name": "prism-mailer",
+  "version": "1.0.0",
+  "main": "sendEmails.js",
+  "scripts": {
+    "start": "node sendEmails.js"
+  },
+  "dependencies": {
+    "google-spreadsheet": "^4.1.1",
+    "nodemailer": "^6.9.11"
+  }
+}
