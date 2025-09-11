@@ -1,88 +1,116 @@
-const nodemailer = require("nodemailer");
 const { google } = require("googleapis");
+const nodemailer = require("nodemailer");
 
-// Google Sheets setup
-const sheets = google.sheets("v4");
-const auth = new google.auth.GoogleAuth({
-  credentials: JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON),
-  scopes: ["https://www.googleapis.com/auth/spreadsheets"],
-});
-const spreadsheetId = process.env.SPREADSHEET_ID;
+// --- Google Sheets Auth ---
+const googleCredentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT);
 
-// Email body (fixed)
-function buildBody(name) {
-  return `
-  Hi ${name},<br><br>
-  Looking to get off load boards and into better-paying freight? At Prism Distributions, we connect serious carriers like you with high-dollar, steady freight that moves fast — no hassle, no stress.<br><br>
-  ✅ Dry Vans<br>✅ Reefers<br>✅ Power Only<br>✅ Step Decks<br>✅ Flatbeds<br>✅ Hotshots<br>✅ Box Trucks<br><br>
-  We provide dispatch that earns more, saves time, and keeps you loaded. Here's what our carriers love:<br><br>
-  💰 $8K–$10K weekly potential — based on actual carriers<br>
-  📈 Transparent low-fee dispatch — no forced loads<br>
-  📝 Full paperwork handling — you drive, we hustle<br>
-  🛡 Fast Pay — no hold-ups, no stress<br><br>
-  If your trailer is ready, so are we. Just send over your ZIP code + equipment and we'll get your week moving now.<br><br>
-  Let's make this your most profitable week yet — real loads, real fast.<br><br>
-  📍 1396 Bramlett Forest Ct, Lawrenceville, GA 30045<br>
-  💳 EIN: 93-4662639<br><br>
-  Best regards,<br>Prism Distributions
-  `;
+const auth = new google.auth.JWT(
+  googleCredentials.client_email,
+  null,
+  googleCredentials.private_key.replace(/\\n/g, "\n"),
+  ["https://www.googleapis.com/auth/spreadsheets"]
+);
+
+const sheets = google.sheets({ version: "v4", auth });
+
+// --- Constants ---
+const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
+const SHEET_NAME = "Emails";
+
+// --- Helpers ---
+function getSmtpCredentials(senderEmail) {
+  const userKey = "SMTP_USER_" + senderEmail.split("@")[0].toUpperCase();
+  const passKey = "SMTP_PASS_" + senderEmail.split("@")[0].toUpperCase();
+
+  const user = process.env[userKey];
+  const pass = process.env[passKey];
+
+  if (!user || !pass) {
+    throw new Error(`Missing SMTP credentials for ${senderEmail}`);
+  }
+
+  return { user, pass };
 }
 
-// Fetch rows from Google Sheet
-async function getRows() {
-  const client = await auth.getClient();
-  const res = await sheets.spreadsheets.values.get({
-    auth: client,
-    spreadsheetId,
-    range: "Emails!A2:H", // Adjust if needed
-  });
-  return res.data.values || [];
-}
-
-// Send email with correct account
-async function sendEmail(sender, recipient, subject, body) {
-  const senderKey = sender.split("@")[0].toUpperCase(); // e.g. JOHNDISPATCHER
+async function sendMail(senderEmail, recipientEmail, subject, body) {
+  const { user, pass } = getSmtpCredentials(senderEmail);
 
   const transporter = nodemailer.createTransport({
     host: "mail.inbox.lv",
     port: 587,
     secure: false,
-    auth: {
-      user: process.env[`SMTP_USER_${senderKey}`],
-      pass: process.env[`SMTP_PASS_${senderKey}`],
-    },
+    auth: { user, pass },
   });
 
-  const info = await transporter.sendMail({
-    from: sender,
-    to: recipient,
-    subject,
+  await transporter.sendMail({
+    from: senderEmail,
+    to: recipientEmail,
+    subject: subject,
     html: body,
   });
-
-  console.log(`✅ Sent to ${recipient} from ${sender}: ${info.messageId}`);
 }
 
-// Main function
-async function main() {
-  const rows = await getRows();
-  let count = 0;
+// --- Main Function ---
+async function processEmails() {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `${SHEET_NAME}!A2:H`,
+  });
 
-  for (const row of rows) {
-    const [recipientEmail, recipientName, subject, bodyHtml, assignedSender, status] = row;
+  const rows = res.data.values || [];
+  if (rows.length === 0) {
+    console.log("No emails found.");
+    return;
+  }
 
-    if (!recipientEmail || !assignedSender || status === "sent") continue;
-    if (count >= 5) break; // limit per run (per account scheduling will balance)
+  let updates = [];
+  let sentCount = 0;
 
-    const body = bodyHtml && bodyHtml.trim() !== "" ? bodyHtml : buildBody(recipientName);
+  for (let i = 0; i < rows.length && sentCount < 5; i++) {
+    let row = rows[i];
+    let [recipientEmail, recipientName, subject, body, assignedSender, status] = row;
+
+    if (status && status.toLowerCase() === "sent") continue;
+
+    // Default body if blank
+    if (!body) {
+      body = `
+        Hi ${recipientName},<br><br>
+        Looking to get off load boards and into better-paying freight? 
+        At Prism Distributions, we connect serious carriers like you with high-dollar, steady freight.<br><br>
+        ✅ Dry Vans<br>✅ Reefers<br>✅ Power Only<br>✅ Step Decks<br>✅ Flatbeds<br><br>
+        Best regards,<br>Prism Distributions
+      `;
+    }
 
     try {
-      await sendEmail(assignedSender, recipientEmail, subject, body);
-      count++;
+      await sendMail(assignedSender, recipientEmail, subject, body);
+      console.log(`✅ Sent to ${recipientEmail} via ${assignedSender}`);
+      updates.push({ row: i + 2, status: "sent", attempts: (row[7] || 0) + 1 });
+      sentCount++;
     } catch (err) {
-      console.error(`❌ Failed to send to ${recipientEmail}: ${err.message}`);
+      console.error(`❌ Failed to ${recipientEmail}: ${err.message}`);
+      updates.push({ row: i + 2, status: "failed", attempts: (row[7] || 0) + 1 });
     }
   }
+
+  // Update sheet
+  const requests = updates.map((u) => ({
+    range: `${SHEET_NAME}!F${u.row}:H${u.row}`,
+    values: [[u.status, "", u.attempts]],
+  }));
+
+  if (requests.length > 0) {
+    await sheets.spreadsheets.values.batchUpdate({
+      spreadsheetId: SPREADSHEET_ID,
+      requestBody: { data: requests, valueInputOption: "RAW" },
+    });
+  }
+
+  console.log(`📨 Done. Sent ${sentCount} emails this run.`);
 }
 
-main().catch(console.error);
+processEmails().catch((err) => {
+  console.error("Fatal error:", err);
+  process.exit(1);
+});
